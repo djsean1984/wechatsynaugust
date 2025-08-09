@@ -1,92 +1,88 @@
 import os
 import requests
 from notion_client import Client
+from typing import List
 
-WEREAD_COOKIE = os.getenv("WEREAD_COOKIE")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+# --- 配置 ---
 
-if not (WEREAD_COOKIE and NOTION_TOKEN and NOTION_DATABASE_ID):
-    print("请设置 WEREAD_COOKIE, NOTION_TOKEN, NOTION_DATABASE_ID 环境变量")
-    exit(1)
+WEREAD_COOKIE = os.getenv("WEREAD_COOKIE")  # 微信读书Cookie，完整复制
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")    # Notion集成token
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # Notion数据库ID
 
-notion = Client(auth=NOTION_TOKEN)
+# 微信读书笔记分页大小
+PAGE_SIZE = 20
 
-def get_weread_notes(start=0, limit=20):
-    url = "https://i.weread.qq.com/book/bookmarklist"
+# --- 请求微信读书接口获取笔记 ---
+
+def get_weread_notes(start: int = 0, limit: int = PAGE_SIZE) -> List[dict]:
+    url = f"https://i.weread.qq.com/book/bookmarklist?start={start}&limit={limit}&orderby=1&selectType=0"
     headers = {
         "Cookie": WEREAD_COOKIE,
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
     }
-    params = {
-        "start": start,
-        "limit": limit,
-        "orderby": 1,
-        "selectType": 0
-    }
-    resp = requests.get(url, headers=headers, params=params)
+    resp = requests.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
-    if data.get("code") != 0:
-        raise Exception(f"微信读书接口错误: {data}")
-    return data.get("data", {})
+    if data.get("errcode") != 0:
+        raise Exception(f"Weread API Error: {data.get('errmsg')}")
+    return data.get("data", {}).get("bookmarkList", [])
 
-def query_notion_page_by_id(bookmark_id):
-    filter_params = {
-        "filter": {
-            "property": "笔记ID",
-            "rich_text": {
-                "equals": bookmark_id
+# --- 处理笔记转换为Notion格式 ---
+
+def convert_to_notion_page(note: dict) -> dict:
+    # 简单转换示例，根据 Notion API 要求构造页面属性
+    title = note.get("content", "")[:100]  # 取笔记内容前100字符作为标题
+    book_name = note.get("bookName", "未知书籍")
+    ctime = note.get("createTime", "")
+
+    notion_page = {
+        "parent": {"database_id": NOTION_DATABASE_ID},
+        "properties": {
+            "Name": {
+                "title": [{"text": {"content": title}}]
+            },
+            "Book": {
+                "rich_text": [{"text": {"content": book_name}}]
+            },
+            "Created Time": {
+                "date": {"start": ctime}
             }
-        }
+        },
+        "children": [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "text": [{"type": "text", "text": {"content": note.get("content", "")}}]
+                }
+            }
+        ]
     }
-    response = notion.databases.query(database_id=NOTION_DATABASE_ID, **filter_params)
-    return response["results"]
+    return notion_page
 
-def add_notion_page(book_name, author, content, bookmark_id):
-    notion.pages.create(
-        parent={"database_id": NOTION_DATABASE_ID},
-        properties={
-            "书名": {
-                "title": [{"text": {"content": book_name}}]
-            },
-            "作者": {
-                "rich_text": [{"text": {"content": author}}]
-            },
-            "笔记": {
-                "rich_text": [{"text": {"content": content}}]
-            },
-            "笔记ID": {
-                "rich_text": [{"text": {"content": bookmark_id}}]
-            }
-        }
-    )
+# --- 写入Notion ---
+
+def add_note_to_notion(notion: Client, page_data: dict):
+    notion.pages.create(**page_data)
+
+# --- 主函数 ---
 
 def main():
+    notion = Client(auth=NOTION_TOKEN)
+
     start = 0
-    limit = 20
-    total_added = 0
     while True:
-        notes_data = get_weread_notes(start, limit)
-        bookmarks = notes_data.get("bookmarkList", [])
-        if not bookmarks:
+        notes = get_weread_notes(start=start, limit=PAGE_SIZE)
+        if not notes:
+            print("笔记获取完毕")
             break
-        for bm in bookmarks:
-            book_name = bm.get("bookName", "未知书名")
-            author = bm.get("author", "未知作者")
-            content = bm.get("content", "").strip()
-            bookmark_id = str(bm.get("id", ""))
-            if not content:
-                continue
-            exists = query_notion_page_by_id(bookmark_id)
-            if exists:
-                print(f"跳过已存在笔记: {content[:20]}...")
-                continue
-            add_notion_page(book_name, author, content, bookmark_id)
-            print(f"添加笔记: 《{book_name}》 - {content[:20]}...")
-            total_added += 1
-        start += limit
-    print(f"同步完成，共添加 {total_added} 条笔记。")
+
+        for note in notes:
+            page = convert_to_notion_page(note)
+            add_note_to_notion(notion, page)
+            print(f"已同步笔记：{note.get('content', '')[:30]}...")
+
+        start += PAGE_SIZE
 
 if __name__ == "__main__":
     main()
